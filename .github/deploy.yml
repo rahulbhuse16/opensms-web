@@ -1,0 +1,96 @@
+
+name: Deploy OpenSMS Frontend to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+
+jobs:
+  deploy:
+    name: Build and Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build React application
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Package frontend build
+        run: tar -czf frontend-dist.tar.gz -C dist .
+
+      - name: Upload build to S3
+        run: |
+          aws s3 cp frontend-dist.tar.gz \
+            s3://opensms-frontend-deploy/frontend-dist.tar.gz
+
+      - name: Deploy frontend on EC2
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$EC2_INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "set -eu",
+              "mkdir -p /opt/opensms/frontend",
+              "aws s3 cp s3://opensms-frontend-deploy/frontend-dist.tar.gz /tmp/frontend-dist.tar.gz",
+              "rm -rf /opt/opensms/frontend/*",
+              "tar -xzf /tmp/frontend-dist.tar.gz -C /opt/opensms/frontend",
+              "nginx -t",
+              "systemctl reload nginx"
+            ]' \
+            --query 'Command.CommandId' \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query 'Status' \
+              --output text 2>/dev/null || echo "Pending")
+
+            echo "Deployment status: $STATUS"
+
+            if [ "$STATUS" = "Success" ]; then
+              exit 0
+            fi
+
+            if [ "$STATUS" = "Failed" ] || [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "TimedOut" ]; then
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$EC2_INSTANCE_ID"
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          echo "Deployment timed out"
+          exit 1
